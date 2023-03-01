@@ -88,5 +88,18 @@
       automerge: false,
       matchManagers: [ "npm" ],
     },
+    // v0.x major version blocks
+    {
+      matchBaseBranches: ["version-0.x"],
+      matchUpdateTypes: ["major"],
+      matchPackagePatterns: [
+        // utils v2 packages are all node 14+
+        "^@apollo/utils.*",
+        // make-fetch-happen and its types
+        "make-fetch-happen"
+      ],
+      matchPackageNames: ["@types/node", "lerna"],
+      disabled: true,
+    }
   ]
 }
