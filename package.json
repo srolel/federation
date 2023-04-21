@@ -5,7 +5,7 @@
   "repository": "github:apollographql/federation",
   "scripts": {
     "clean": "git clean -dfqX -- ./target ./node_modules **/{dist,node_modules}/ ./*/tsconfig*tsbuildinfo",
-    "compile": "tsc --build tsconfig.build.json",
+    "compile": "set",
     "compile:clean": "npm run compile -- --clean",
     "watch": "npm run compile && tsc --build tsconfig.json --watch",
     "version": "npm i --package-lock-only && git add package-lock.json",
