@@ -1,105 +1,35 @@
-import { isObject } from '../utilities/predicates';
-import { GraphQLDataSource, GraphQLDataSourceProcessOptions, GraphQLDataSourceRequestKind } from './types';
-import { createHash } from '@apollo/utils.createhash';
+import { GraphQLDataSourceProcessOptions } from '@apollo/gateway';
+import { GraphQLDataSourceRequestKind } from '@apollo/gateway/dist/datasources/types';
 import { ResponsePath } from '@apollo/query-planner';
-import { parseCacheControlHeader } from './parseCacheControlHeader';
-import fetcher from 'make-fetch-happen';
-import { Headers as NodeFetchHeaders, Request as NodeFetchRequest } from 'node-fetch';
+import {
+  GatewayCacheHint,
+  GatewayCachePolicy,
+  GatewayGraphQLRequest,
+  GatewayGraphQLRequestContext,
+  GatewayGraphQLResponse,
+} from '@apollo/server-gateway-interface';
 import { Fetcher, FetcherRequestInit, FetcherResponse } from '@apollo/utils.fetcher';
+import { createHash } from 'crypto';
 import { GraphQLError, GraphQLErrorExtensions } from 'graphql';
-import { GatewayCacheHint, GatewayCachePolicy, GatewayGraphQLRequest, GatewayGraphQLRequestContext, GatewayGraphQLResponse } from '@apollo/server-gateway-interface';
+import { isObject } from 'lodash';
+import { Headers as FetchHeaders, Request as NodeFetchRequest } from 'node-fetch';
+import { RequestContext } from '../../requestNamespace';
 
-export class RemoteGraphQLDataSource<
-  TContext extends Record<string, any> = Record<string, any>,
-> implements GraphQLDataSource<TContext>
-{
-  fetcher: Fetcher;
-
+export class RemoteGraphQLDataSource {
   constructor(
-    config?: Partial<RemoteGraphQLDataSource<TContext>> &
-      object &
-      ThisType<RemoteGraphQLDataSource<TContext>>,
-  ) {
-    this.fetcher = fetcher.defaults({
-      // Allow an arbitrary number of sockets per subgraph. This is the default
-      // behavior of Node's http.Agent as well as the npm package agentkeepalive
-      // which wraps it, but is not the default behavior of make-fetch-happen
-      // which wraps agentkeepalive (that package sets this to 15 by default).
-      maxSockets: Infinity,
-      // although this is the default, we want to take extra care and be very
-      // explicity to ensure that mutations cannot be retried. please leave this
-      // intact.
-      retry: false,
-    });
-    if (config) {
-      return Object.assign(this, config);
+    protected config: {
+      // whether to honor the cache-control header sent from the client or specified in the query
+      honorSubgraphCacheControlHeader?: boolean;
+      url: string;
+      apq?: boolean;
+      fetcher: Fetcher;
     }
-  }
+  ) {}
 
-  url!: string;
-
-  /**
-   * Whether the downstream request should be made with automated persisted
-   * query (APQ) behavior enabled.
-   *
-   * @remarks When enabled, the request to the downstream service will first be
-   * attempted using a SHA-256 hash of the operation rather than including the
-   * operation itself. If the downstream server supports APQ and has this
-   * operation registered in its APQ storage, it will be able to complete the
-   * request without the entirety of the operation document being transmitted.
-   *
-   * In the event that the downstream service is unaware of the operation, it
-   * will respond with an `PersistedQueryNotFound` error and it will be resent
-   * with the full operation body for fulfillment.
-   *
-   * Generally speaking, when the downstream server is processing similar
-   * operations repeatedly, APQ can offer substantial network savings in terms
-   * of bytes transmitted over the wire between gateways and downstream servers.
-   */
-  apq: boolean = false;
-
-  /**
-   * Should cache-control response headers from subgraphs affect the operation's
-   * cache policy? If it shouldn't, set this to false.
-   */
-  honorSubgraphCacheControlHeader: boolean = true;
-
-  async process(
-    options: GraphQLDataSourceProcessOptions<TContext>,
-  ): Promise<GatewayGraphQLResponse> {
-    const { request, context: originalContext } = options;
-    const pathInIncomingRequest =
-      options.kind === GraphQLDataSourceRequestKind.INCOMING_OPERATION
-        ? options.pathInIncomingRequest
-        : undefined;
-
-    // Deal with a bit of a hairy situation in typings: when doing health checks
-    // and schema checks we always pass in `{}` as the context even though it's
-    // not really guaranteed to be a `TContext`, and then we pass it to various
-    // methods on this object. The reason this "works" is that the DataSourceMap
-    // and Service types aren't generic-ized on TContext at all (so `{}` is in
-    // practice always legal there)... ie, the genericness of this class is
-    // questionable in the first place.
-    const context = originalContext as TContext;
-
-    // Respect incoming http headers (eg, apollo-federation-include-trace).
-    const headers = new NodeFetchHeaders();
-    if (request.http?.headers) {
-      for (const [name, value] of request.http.headers) {
-        headers.append(name, value);
-      }
-    }
-    headers.set('Content-Type', 'application/json');
-
-    request.http = {
-      method: 'POST',
-      url: this.url,
-      headers,
-    };
-
-    if (this.willSendRequest) {
-      await this.willSendRequest(options);
-    }
+  async sendRequest(
+    options: GraphQLDataSourceProcessOptions<RequestContext>
+  ): Promise<{ request: GatewayGraphQLRequest; response: GatewayGraphQLResponse }> {
+    const { request, context } = options;
 
     if (!request.query) {
       throw new Error('Missing query');
@@ -107,18 +37,10 @@ export class RemoteGraphQLDataSource<
 
     const { query, ...requestWithoutQuery } = request;
 
-    // Special handling of cache-control headers in response. Requires
-    // Apollo Server 3, so we check to make sure the method we want is
-    // there.
-    const overallCachePolicy =
-      this.honorSubgraphCacheControlHeader &&
-      options.kind === GraphQLDataSourceRequestKind.INCOMING_OPERATION &&
-      options.incomingRequestContext.overallCachePolicy &&
-      'restrict' in options.incomingRequestContext.overallCachePolicy
-        ? options.incomingRequestContext.overallCachePolicy
-        : null;
-
-    if (this.apq) {
+    // If APQ was enabled, we'll run the same request again, but add in the
+    // previously omitted `query`.  If APQ was NOT enabled, this is the first
+    // request (non-APQ, all the way).
+    if (this.config.apq) {
       const apqHash = createHash('sha256').update(request.query).digest('hex');
 
       // Take the original extensions and extend them with
@@ -131,26 +53,15 @@ export class RemoteGraphQLDataSource<
         },
       };
 
-      const apqOptimisticResponse = await this.sendRequest(
-        requestWithoutQuery,
-        context,
-      );
+      const apqOptimisticResponse = await this._sendRequest(requestWithoutQuery, context as RequestContext);
 
       // If we didn't receive notice to retry with APQ, then let's
       // assume this is the best result we'll get and return it!
       if (
         !apqOptimisticResponse.errors ||
-        !apqOptimisticResponse.errors.find(
-          (error) => error.message === 'PersistedQueryNotFound',
-        )
+        !apqOptimisticResponse.errors.find((error) => error.message === 'PersistedQueryNotFound')
       ) {
-        return this.respond({
-          response: apqOptimisticResponse,
-          request: requestWithoutQuery,
-          context,
-          overallCachePolicy,
-          pathInIncomingRequest
-        });
+        return { request: requestWithoutQuery, response: apqOptimisticResponse };
       }
     }
 
@@ -161,20 +72,64 @@ export class RemoteGraphQLDataSource<
       query,
       ...requestWithoutQuery,
     };
-    const response = await this.sendRequest(requestWithQuery, context);
+
+    const response = await this._sendRequest(requestWithQuery, context as RequestContext);
+
+    return { request: requestWithQuery, response };
+  }
+
+  public willSendRequest?(options: GraphQLDataSourceProcessOptions<RequestContext>): void | Promise<void>;
+
+  toFetchHeaders(headers?: { [Symbol.iterator](): Iterator<[string, string]> } | [string, string][]): FetchHeaders {
+    const fetchHeaders = new FetchHeaders();
+    if (headers) {
+      for (const [key, value] of headers) {
+        fetchHeaders.append(key, value);
+      }
+    }
+    return fetchHeaders;
+  }
+
+  async process(options: GraphQLDataSourceProcessOptions<RequestContext>): Promise<GatewayGraphQLResponse> {
+    // Respect incoming http headers (eg, apollo-federation-include-trace).
+    const headers = this.toFetchHeaders(options.request.http?.headers);
+    headers.set('Content-Type', 'application/json');
+
+    options.request.http = {
+      method: 'POST',
+      url: this.config.url,
+      headers,
+    };
+
+    this.willSendRequest?.(options);
+
+    if (!options.request.query) {
+      throw new Error('Missing query');
+    }
+
+    // Special handling of cache-control headers in response. Requires
+    // Apollo Server 3, so we check to make sure the method we want is
+    // there.
+    const overallCachePolicy =
+      this.config.honorSubgraphCacheControlHeader &&
+      options.kind === GraphQLDataSourceRequestKind.INCOMING_OPERATION &&
+      options.incomingRequestContext.overallCachePolicy &&
+      'restrict' in options.incomingRequestContext.overallCachePolicy
+        ? options.incomingRequestContext.overallCachePolicy
+        : null;
+
+    const { request, response } = await this.sendRequest(options);
     return this.respond({
       response,
-      request: requestWithQuery,
-      context,
+      request,
+      context: options.context as RequestContext,
       overallCachePolicy,
-      pathInIncomingRequest
+      pathInIncomingRequest:
+        options.kind === GraphQLDataSourceRequestKind.INCOMING_OPERATION ? options.pathInIncomingRequest : undefined,
     });
   }
 
-  private async sendRequest(
-    request: GatewayGraphQLRequest,
-    context: TContext,
-  ): Promise<GatewayGraphQLResponse> {
+  private async _sendRequest(request: GatewayGraphQLRequest, context: RequestContext): Promise<GatewayGraphQLResponse> {
     // This would represent an internal programming error since this shouldn't
     // be possible in the way that this method is invoked right now.
     if (!request.http) {
@@ -202,10 +157,9 @@ export class RemoteGraphQLDataSource<
 
     try {
       // Use our local `fetcher` to allow for fetch injection
-      // Use the fetcher's `Request` implementation for compatibility
-      fetchResponse = await this.fetcher(http.url, requestInit);
+      fetchResponse = await this.config.fetcher(http.url, requestInit);
 
-      if (!fetchResponse.ok) {
+      if (!fetchResponse?.ok) {
         throw await this.errorFromResponse(fetchResponse);
       }
 
@@ -220,27 +174,36 @@ export class RemoteGraphQLDataSource<
         http: fetchResponse,
       };
     } catch (error) {
-      this.didEncounterError(error, fetchRequest, fetchResponse, context);
+      this.didEncounterError(error as Error, fetchRequest, fetchResponse, context);
       throw error;
     }
   }
 
-  public willSendRequest?(
-    options: GraphQLDataSourceProcessOptions<TContext>,
-  ): void | Promise<void>;
+  parseCacheControlHeader(header: string | null | undefined): Record<string, string | true> {
+    const cc: Record<string, string | true> = {};
+    if (!header) return cc;
+
+    const parts = header.trim().split(/\s*,\s*/);
+    for (const part of parts) {
+      const [k, v] = part.split(/\s*=\s*/, 2);
+      cc[k] = v === undefined ? true : v.replace(/^"|"$/g, '');
+    }
+
+    return cc;
+  }
 
   private async respond({
     response,
     request,
     context,
     overallCachePolicy,
-    pathInIncomingRequest
+    pathInIncomingRequest,
   }: {
     response: GatewayGraphQLResponse;
     request: GatewayGraphQLRequest;
-    context: TContext;
+    context: RequestContext;
     overallCachePolicy: GatewayCachePolicy | null;
-    pathInIncomingRequest?: ResponsePath
+    pathInIncomingRequest?: ResponsePath;
   }): Promise<GatewayGraphQLResponse> {
     const processedResponse =
       typeof this.didReceiveResponse === 'function'
@@ -248,24 +211,18 @@ export class RemoteGraphQLDataSource<
         : response;
 
     if (overallCachePolicy) {
-      const parsed = parseCacheControlHeader(
-        response.http?.headers.get('cache-control'),
-      );
+      const parsed = this.parseCacheControlHeader(response.http?.headers.get('cache-control'));
 
-      // If the subgraph does not specify a max-age, we assume its response (and
-      // thus the overall response) is uncacheable. (If you don't like this, you
-      // can tweak the `cache-control` header in your `didReceiveResponse`
-      // method.)
-      const hint: GatewayCacheHint = { maxAge: 0 };
+      const hint: GatewayCacheHint = {};
       const maxAge = parsed['max-age'];
       if (typeof maxAge === 'string' && maxAge.match(/^[0-9]+$/)) {
         hint.maxAge = +maxAge;
       }
-      if (parsed['private'] === true) {
-        hint.scope = 'PRIVATE';
-      }
       if (parsed['public'] === true) {
         hint.scope = 'PUBLIC';
+      }
+      if (parsed['private'] === true) {
+        hint.scope = 'PRIVATE';
       }
       overallCachePolicy.restrict(hint);
     }
@@ -274,16 +231,16 @@ export class RemoteGraphQLDataSource<
   }
 
   public didReceiveResponse?(
-    requestContext: Required<
-      Pick<GatewayGraphQLRequestContext<TContext>, 'request' | 'response' | 'context'>
-    > & { pathInIncomingRequest?: ResponsePath }
+    requestContext: Required<Pick<GatewayGraphQLRequestContext<RequestContext>, 'request' | 'response' | 'context'>> & {
+      pathInIncomingRequest?: ResponsePath;
+    }
   ): GatewayGraphQLResponse | Promise<GatewayGraphQLResponse>;
 
   public didEncounterError(
     error: Error,
     _fetchRequest: NodeFetchRequest,
     _fetchResponse?: FetcherResponse,
-    _context?: TContext,
+    _context?: RequestContext
   ) {
     throw error;
   }
@@ -291,7 +248,7 @@ export class RemoteGraphQLDataSource<
   public parseBody(
     fetchResponse: FetcherResponse,
     _fetchRequest?: NodeFetchRequest,
-    _context?: TContext,
+    _context?: RequestContext
   ): Promise<object | string> {
     const contentType = fetchResponse.headers.get('Content-Type');
     if (contentType && contentType.startsWith('application/json')) {
